@@ -14,7 +14,7 @@ A Google Apps Script that provides **bidirectional sync** between a Google Sheet
 
 ## 📋 Sheet Structure
 
-Your Google Sheet must have a tab named `Products` with these columns (in order):
+Your Google Sheet must have these columns (in order):
 
 | Col | Field | Description |
 |-----|-------|-------------|
