@@ -76,10 +76,84 @@ function markError(rowIndex, errorMessage) {
   sheet.getRange(rowIndex, cols.LAST_SYNC).setValue(new Date());
 }
 
+// --- Image Helpers ---
+
+/**
+ * Strips WordPress-added suffixes from a filename for comparison.
+ * e.g. "product-1.jpg" → "product.jpg", "photo-scaled.jpg" → "photo.jpg",
+ *      "image-100x100.png" → "image.png"
+ */
+function normalizeWPFilename(filename) {
+  if (!filename) return '';
+  const dot = filename.lastIndexOf('.');
+  if (dot === -1) return filename.toLowerCase();
+
+  const base = filename.substring(0, dot);
+  const ext = filename.substring(dot); // includes the dot
+
+  // Remove WP suffixes: -1, -2, -scaled, -rotated, -100x100, etc.
+  const cleaned = base.replace(/-(\d+|scaled|rotated|\d+x\d+)$/, '');
+  return (cleaned + ext).toLowerCase();
+}
+
+/**
+ * Searches the WordPress Media Library for an existing image by filename.
+ * Returns the media ID if found, or null if not found.
+ */
+function findExistingMediaByFilename(filename) {
+  if (!filename) return null;
+
+  try {
+    // Strip extension for the search query (WP search matches on title/slug)
+    const searchTerm = filename.replace(/\.[^.]+$/, '');
+    const url = WP_API + `/media?search=${encodeURIComponent(searchTerm)}&per_page=20`;
+
+    const options = {
+      method: "GET",
+      headers: {
+        "Authorization": "Basic " + CONFIG.WP_AUTH
+      },
+      muteHttpExceptions: true
+    };
+
+    const response = UrlFetchApp.fetch(url, options);
+    if (response.getResponseCode() >= 400) return null;
+
+    const mediaItems = JSON.parse(response.getContentText());
+    if (!Array.isArray(mediaItems) || mediaItems.length === 0) return null;
+
+    const normalizedTarget = normalizeWPFilename(filename);
+
+    // Check each result for a match (compare normalized filenames)
+    for (const item of mediaItems) {
+      const srcFilename = (item.source_url || '').split('/').pop().split('?')[0];
+      if (normalizeWPFilename(srcFilename) === normalizedTarget) {
+        return item.id;
+      }
+    }
+
+    return null;
+  } catch (e) {
+    Logger.log('Media search error: ' + e.message);
+    return null;
+  }
+}
+
 // --- Image Upload ---
 
+/**
+ * Uploads an image to WP Media Library from Google Drive.
+ * First checks if the image already exists in the media library to avoid duplicates.
+ */
 function uploadImageToWP(filename) {
   try {
+    // Check if already uploaded to WordPress
+    const existingId = findExistingMediaByFilename(filename);
+    if (existingId) {
+      Logger.log('Image "' + filename + '" already exists in WP Media (ID: ' + existingId + '), skipping upload.');
+      return existingId;
+    }
+
     const folder = DriveApp.getFolderById(CONFIG.DRIVE_FOLDER_ID);
     const files = folder.getFilesByName(filename);
 
@@ -254,16 +328,26 @@ function buildPayload(row, existingProduct) {
   // Handle image
   if (row.imageFile) {
     // Check if existing product already has this image (skip re-upload)
-    let existingImageName = '';
+    // Use normalized comparison to handle WP suffixes like -1, -scaled, etc.
     if (existingProduct && existingProduct.images && existingProduct.images.length > 0) {
-      existingImageName = existingProduct.images[0].src.split('/').pop().split('?')[0];
-    }
+      const existingImageName = existingProduct.images[0].src.split('/').pop().split('?')[0];
 
-    if (existingImageName === row.imageFile) {
-      // Same image — keep existing, don't re-upload
-      payload.images = [{ id: existingProduct.images[0].id }];
+      if (normalizeWPFilename(existingImageName) === normalizeWPFilename(row.imageFile)) {
+        // Same image — keep existing, don't re-upload
+        payload.images = [{ id: existingProduct.images[0].id }];
+      } else {
+        // Different image — upload (uploadImageToWP already checks for duplicates)
+        try {
+          const wpImageId = uploadImageToWP(row.imageFile);
+          if (wpImageId) {
+            payload.images = [{ id: wpImageId }];
+          }
+        } catch (imgErr) {
+          Logger.log('Image upload error for row ' + row.rowIndex + ': ' + imgErr.message);
+        }
+      }
     } else {
-      // New or changed image — upload it
+      // No existing product or no images — upload (with built-in duplicate check)
       try {
         const wpImageId = uploadImageToWP(row.imageFile);
         if (wpImageId) {
@@ -271,7 +355,6 @@ function buildPayload(row, existingProduct) {
         }
       } catch (imgErr) {
         Logger.log('Image upload error for row ' + row.rowIndex + ': ' + imgErr.message);
-        // Don't fail the whole product update over an image error
       }
     }
   }
